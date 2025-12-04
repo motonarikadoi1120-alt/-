@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>地下サバイバルゲーム 完全版＋掘削＆ジャンプ</title>
+<style>
+body { margin:0; overflow:hidden; }
+#invUI {
+  position: fixed; bottom: 10px; left: 10px;
+  padding: 10px; background: rgba(0,0,0,0.5);
+  color: #fff; font-size: 14px; border-radius: 8px; max-width: 250px;
+}
+#miniMap {
+  position: fixed; top: 10px; right: 10px;
+  width: 150px; height: 150px; background: rgba(0,0,0,0.5); border-radius: 8px;
+}
+canvas { display:block; }
+</style>
+</head>
+<body>
+<div id="invUI">Inventory</div>
+<div id="miniMap"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r150/three.min.js"></script>
+<script>
+// ============================
+// ★ 完全版統合ゲーム＋掘削＆ジャンプ
+// ============================
+
+// --- 基本シーン ---
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x000000,0.08);
+const camera = new THREE.PerspectiveCamera(75,window.innerWidth/window.innerHeight,0.1,1000);
+camera.position.set(0,5,10);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth,window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// --- 光源 ---
+const ambient = new THREE.AmbientLight(0x888888);
+scene.add(ambient);
+const pointLight = new THREE.PointLight(0xffffff,1,100);
+pointLight.position.set(0,50,0);
+scene.add(pointLight);
+
+// --- プレイヤー ---
+const player = {pos:new THREE.Vector3(0,0,0), hp:20, maxHp:20, level:1, exp:0, money:100};
+let toolLevel=1;
+let velocityY=0;
+let canJump=false;
+
+// --- マテリアル ---
+const matDirt = new THREE.MeshLambertMaterial({color:0x886633});
+const matStone = new THREE.MeshLambertMaterial({color:0x888888});
+const matIron = new THREE.MeshLambertMaterial({color:0xaaaaaa});
+const matCopper = new THREE.MeshLambertMaterial({color:0xff8800});
+const matGold = new THREE.MeshLambertMaterial({color:0xffcc00});
+const matDiamond = new THREE.MeshLambertMaterial({color:0x66e0ff});
+const matHardStone = new THREE.MeshLambertMaterial({color:0x555555});
+const matUltraStone = new THREE.MeshLambertMaterial({color:0x222222});
+const matWood = new THREE.MeshLambertMaterial({color:0x8b5a2b});
+
+// --- インベントリ ---
+let inventory = {};
+const invUI = document.getElementById('invUI');
+function refreshInventoryUI(){
+  invUI.innerHTML = `<b>HP:</b> ${player.hp}/${player.maxHp}<br>`+
+                    `<b>Level:</b> ${player.level}  <b>Exp:</b> ${player.exp}/50<br>`+
+                    `<b>Money:</b> ${player.money}<br>`+
+                    '<b>Inventory</b><br>'+
+                    Object.entries(inventory).map(([k,v])=>`${k}: ${v}`).join('<br>');
+}
+setInterval(refreshInventoryUI, 500);
+
+// --- 洞窟・地面生成 ---
+const blockSize=1;
+let blocks=[];
+const WORLD_W=30, WORLD_D=30, WORLD_H=15;
+for(let x=-WORLD_W/2;x<WORLD_W/2;x++){
+  for(let z=-WORLD_D/2;z<WORLD_D/2;z++){
+    for(let y=-WORLD_H;y<0;y++){
+      let mat=matStone;
+      const depth=-y; const r=Math.random();
+      if(depth>12 && r<0.05) mat=matUltraStone;
+      else if(depth>10 && r<0.1) mat=matHardStone;
+      else if(depth>6 && r<0.1) mat=matIron;
+      else if(depth>4 && r<0.08) mat=matCopper;
+      else if(depth>8 && r<0.03) mat=matDiamond;
+      const geo=new THREE.BoxGeometry(blockSize,blockSize,blockSize);
+      const mesh=new THREE.Mesh(geo,mat);
+      mesh.position.set(x*blockSize,y*blockSize,z*blockSize);
+      scene.add(mesh);
+      blocks.push({mesh,type:mat});
+    }
+  }
+}
+
+// --- 採掘速度 ---
+function getMiningSpeed(){ return 1/(toolLevel+player.level*0.1); }
+
+// --- 敵 ---
+let enemies=[];
+class Enemy{
+  constructor(x,y,z,color=0xaa3333,hp=10,speed=0.02){
+    const geo=new THREE.BoxGeometry(1,2,1);
+    const mat=new THREE.MeshLambertMaterial({color});
+    this.mesh=new THREE.Mesh(geo,mat);
+    this.mesh.position.set(x,y,z);
+    scene.add(this.mesh);
+    this.hp=hp; this.speed=speed;
+  }
+  update(){
+    const dir=new THREE.Vector3(player.pos.x-this.mesh.position.x,0,player.pos.z-this.mesh.position.z).normalize();
+    this.mesh.position.x += dir.x*this.speed;
+    this.mesh.position.z += dir.z*this.speed;
+    if(player.pos.distanceTo(this.mesh.position)<1.2 && (!this.lastHit || Date.now()-this.lastHit>800)){
+      player.hp -= 2; this.lastHit=Date.now();
+    }
+  }
+}
+
+// --- 遠距離敵 ---
+class RangedEnemy extends Enemy{
+  constructor(x,y,z){ super(x,y,z,0x9933ff,12,0.015); this.fireCooldown=0;}
+  update(){
+    super.update();
+    const dist=player.pos.distanceTo(this.mesh.position);
+    if(dist<10 && Date.now()-this.fireCooldown>2000){
+      this.fireCooldown=Date.now();
+      this.shootArrow();
+    }
+  }
+  shootArrow(){
+    const arrow=new THREE.Mesh(new THREE.CylinderGeometry(0.05,0.05,1),new THREE.MeshLambertMaterial({color:0xaaaaaa}));
+    arrow.position.copy(this.mesh.position);
+    scene.add(arrow);
+    const dir=new THREE.Vector3(player.pos.x-this.mesh.position.x,0,player.pos.z-this.mesh.position.z).normalize();
+    const vel=dir.multiplyScalar(0.2);
+    function moveArrow(){
+      arrow.position.add(vel);
+      if(arrow.position.distanceTo(player.pos)<0.5){ player.hp-=3; scene.remove(arrow); }
+      else if(arrow.position.y<-20) scene.remove(arrow);
+      else requestAnimationFrame(moveArrow);
+    }
+    moveArrow();
+  }
+}
+
+// --- 商人・ショップ ---
+class Merchant{
+  constructor(x,y,z){
+    const geo=new THREE.BoxGeometry(1.2,2,1.2);
+    const mat=new THREE.MeshLambertMaterial({color:0xffaa00});
+    this.mesh=new THREE.Mesh(geo,mat);
+    this.mesh.position.set(x,y,z);
+    scene.add(this.mesh);
+    this.items=[{name:'階段',cost:10},{name:'ドア',cost:15},{name:'キャンプファイヤー',cost:20}];
+  }
+  interact(){
+    let shopText='ショップ:\n';
+    this.items.forEach((i,j)=>shopText+=`${j+1}: ${i.name} ${i.cost}G\n`);
+    const choice=prompt(shopText+'番号を入力:');
+    const item=this.items[parseInt(choice)-1];
+    if(item && player.money>=item.cost){
+      player.money-=item.cost;
+      inventory[item.name]=(inventory[item.name]||0)+1;
+      alert(`${item.name}を購入！`);
+    } else alert('お金が足りない');
+  }
+}
+
+// --- 建築設置 ---
+function placeBlock(type,pos){
+  let mat=matWood;
+  if(type=='階段') mat=matStone;
+  else if(type=='ドア') mat=matIron;
+  else if(type=='キャンファイヤー') mat=matGold;
+  const geo=new THREE.BoxGeometry(1,1,1);
+  const mesh=new THREE.Mesh(geo,mat);
+  mesh.position.copy(pos);
+  scene.add(mesh);
+  blocks.push({mesh,type});
+  inventory[type]--;
+}
+
+// --- 精錬・クラフト ---
+function smelt(item){
+  if(item=='鉄鉱石' && inventory[item]>=1){ inventory[item]--; inventory['鉄インゴット']=(inventory['鉄インゴット']||0)+1; }
+}
+function craft(item){
+  if(item=='鉄ツルハシ' && inventory['鉄インゴット']>=3){ inventory['鉄インゴット']-=3; inventory['鉄ツルハシ']=(inventory['鉄ツルハシ']||0)+1; }
+}
+
+// --- レベルアップ ---
+function gainExp(amount){
+  player.exp+=amount;
+  if(player.exp>=50){
+    player.level++;
+    player.exp=0;
+    player.hp+=5;
+    toolLevel++;
+    alert(`レベルアップ！ 現在レベル: ${player.level}`);
+  }
+}
+
+// --- ミニマップ ---
+const miniMapCanvas=document.getElementById('miniMap');
+const miniCtx=miniMapCanvas.getContext('2d');
+function drawMiniMap(){
+  miniCtx.fillStyle='black';
+  miniCtx.fillRect(0,0,150,150);
+  miniCtx.fillStyle='red'; miniCtx.fillRect(75+player.pos.x,75+player.pos.z,2,2);
+  miniCtx.fillStyle='blue'; enemies.forEach(e=>miniCtx.fillRect(75+e.mesh.position.x,75+e.mesh.position.z,2,2));
+}
+setInterval(drawMiniMap,200);
+
+// --- 敵湧き ---
+function isDark(pos){
+  let dark=true;
+  scene.traverse(obj=>{if(obj instanceof THREE.PointLight && obj.position.distanceTo(pos)<10) dark=false;});
+  return dark;
+}
+setInterval(()=>{
+  const x=Math.random()*20-10, z=Math.random()*20-10, y=Math.random()*-10;
+  const pos=new THREE.Vector3(x,y,z);
+  if(isDark(pos) && Math.random()<0.2) enemies.push(Math.random()<0.5? new Enemy(x,y,z) : new RangedEnemy(x,y,z));
+},5000);
+
+// --- 商人スポーン例 ---
+const merchant=new Merchant(5,0,-5);
+
+// --- キーボード操作 ---
+const keys={};
+window.addEventListener('keydown', e=>keys[e.key]=true);
+window.addEventListener('keyup', e=>keys[e.key]=false);
+
+// --- 掘削 ---
+function mine(){
+  const target = blocks.find(b => b.mesh.position.distanceTo(player.pos)<1.5);
+  if(target){
+    scene.remove(target.mesh);
+    inventory[target.type.name] = (inventory[target.type.name.name]||0)+1;
+    blocks = blocks.filter(b => b!==target);
+  }
+}
+
+// --- ゲームループ ---
+function animate(){
+  // --- プレイヤー移動 ---
+  const speed = 0.2;
+  if(keys['w']) player.pos.z -= speed;
+  if(keys['s']) player.pos.z += speed;
+  if(keys['a']) player.pos.x -= speed;
+  if(keys['d']) player.pos.x += speed;
+  
+  // --- ジャンプ & 重力 ---
+  if(keys[' ']){ if(canJump){ velocityY=0.3; canJump=false; } }
+  velocityY -= 0.01; // 重力
+  player.pos.y += velocityY;
+  if(player.pos.y<=0){ player.pos.y=0; velocityY=0; canJump=true; }
+  
+  // --- 掘削 ---
+  if(keys['f']) mine();
+  
+  // --- カメラ追従 ---
+  camera.position.x = player.pos.x;
+  camera.position.y = player.pos.y + 5;
+  camera.position.z = player.pos.z + 10;
+  camera.lookAt(player.pos);
+  
+  // --- 敵更新 ---
+  enemies.forEach(e=>e.update());
+  
+  renderer.render(scene,camera);
+  requestAnimationFrame(animate);
+}
+animate();
+</script>
+</body>
+</html>
